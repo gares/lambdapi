@@ -18,3 +18,7 @@
 (menhir
  (flags (--external-tokens Legacy_lexer))
  (modules menhir_parser))
+
+(env
+  (dev
+    (flags (:standard -warn-error -A))))
