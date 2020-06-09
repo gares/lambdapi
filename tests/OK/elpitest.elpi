@@ -1,0 +1,3 @@
+main T :-
+  print T,
+  print {lp.term->string T}.
