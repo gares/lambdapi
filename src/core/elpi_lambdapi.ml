@@ -50,7 +50,8 @@ let embed_term : Terms.term Conversion.embedding = fun ~depth st t ->
   let open RawData in
   let open Terms in
   let gls = ref [] in
-  let call f ~depth s x = let s, x, g = f ~depth s x in gls := g @ !gls; s, x in
+  let call f ~depth s x =
+    let s, x, g = f ~depth s x in gls := g @ !gls; s, x in
   let rec aux ~depth ctx st t =
     match Terms.unfold t with
     | Vari v ->
@@ -92,11 +93,13 @@ let embed_term : Terms.term Conversion.embedding = fun ~depth st t ->
   let st, t = aux ~depth [] st t in
   st, t, List.rev !gls
 
-let readback_term_box : Terms.term Bindlib.box Conversion.readback = fun ~depth st t ->
+let readback_term_box : Terms.term Bindlib.box Conversion.readback =
+fun ~depth st t ->
   let open RawData in
   let open Terms in
   let gls = ref [] in
-  let call f ~depth s x = let s, x, g = f ~depth s x in gls := g @ !gls; s, x in
+  let call f ~depth s x =
+    let s, x, g = f ~depth s x in gls := g @ !gls; s, x in
   let rec aux ~depth ctx st t =
     match look ~depth t with
     | Const c when c == typec -> st, _Type
@@ -172,7 +175,8 @@ let readback_mbinder st t =
     | Lam bo -> aux ~depth:(depth+1) (nvars+1) bo
     | _ ->
         let open Bindlib in
-        let vs = Array.init nvars (fun i -> new_var Terms.mkfree (Printf.sprintf "x%d" i)) in
+        let vs = Array.init nvars (fun i ->
+          new_var Terms.mkfree (Printf.sprintf "x%d" i)) in
         let st, t, _ = readback_term_box ~depth st t in
         st, unbox (bind_mvar vs t)
   in
@@ -256,11 +260,14 @@ fun ss file predicate arg ->
   let arg = Scope.scope_term Public ss Env.empty arg in
   let elpi = match !elpi with None -> assert false | Some x -> x in
   let ast = Parse.program ~elpi [file] in
-  let prog = Elpi.API.Compile.program ~flags:Elpi.API.Compile.default_flags ~elpi [ast] in
+  let prog =
+    Elpi.API.Compile.program
+      ~flags:Elpi.API.Compile.default_flags ~elpi [ast] in
   let loc = loc_of_pos pos in
   let arguments = Query.(D(term,arg,N)) in
   let query = Query.(compile prog loc (Query { predicate; arguments })) in
-  if not (Elpi.API.Compile.static_check ~checker:(Elpi.Builtin.default_checker ()) query) then
+  if not (Elpi.API.Compile.static_check
+            ~checker:(Elpi.Builtin.default_checker ()) query) then
     Console.fatal pos "elpi: type error";
   let exe = Elpi.API.Compile.optimize query in
   Format.printf "\nelpi: before: %a\n" Print.pp_term arg;

@@ -9,7 +9,8 @@ open Timed
     extension of context [ctx] with the assumption that [x] has type [a] (only
     if [x] occurs in [t]). If [def] is of the form [Some(u)], the context also
     registers the term [u] as the definition of variable [x]. *)
-let unbind : 'a actxt -> 'a -> term option -> tbinder -> tvar * term * 'a actxt =
+let unbind : 'a actxt -> 'a -> term option -> tbinder ->
+  tvar * term * 'a actxt =
   fun ctx a def b ->
   let (x, t) = Bindlib.unbind b in
   (x, t, if Bindlib.binder_occur b then (x, a, def) :: ctx else ctx)
