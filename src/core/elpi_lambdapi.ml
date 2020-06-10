@@ -1,5 +1,24 @@
 open Elpi.API
 
+module Elpi_AUX = struct
+  let array_map_fold f st a =
+    let len = Array.length a in
+    let st = ref st in
+    let b = Array.make len RawData.mkNil in
+    for i = 0 to len-1 do
+      let st', x = f !st a.(i) in
+      st := st';
+      b.(i) <- x
+    done;
+    !st, b
+
+  let list_map_fold f s l =
+    let f st x = let st, x = f st x in st, x, [] in
+    let s, l, _ = Utils.map_acc f s l in
+    s, l
+
+end
+
 let sym : Terms.sym Conversion.t = OpaqueData.declare {
   OpaqueData.name = "symbol";
   doc = "A symbol";
@@ -17,12 +36,23 @@ let prodc = RawData.Constants.declare_global_symbol "prod"
 let abstc = RawData.Constants.declare_global_symbol "abst"
 let applc = RawData.Constants.declare_global_symbol "appl"
 
+module M = struct
+  type t = Terms.meta
+  let compare m1 m2 = Stdlib.compare m1.Terms.meta_key m2.Terms.meta_key
+  let pp = Print.pp_meta
+  let show m = Format.asprintf "%a" pp m
+end
+module MM = FlexibleData.Map(M)
+
+let metamap : MM.t State.component = MM.uvmap
+
 let embed_term : Terms.term Conversion.embedding = fun ~depth st t ->
   let open RawData in
   let open Terms in
   let gls = ref [] in
   let call f ~depth s x = let s, x, g = f ~depth s x in gls := g @ !gls; s, x in
-  let rec aux ~depth st ctx = function
+  let rec aux ~depth ctx st t =
+    match Terms.unfold t with
     | Vari v ->
         let d = Ctxt.type_of v ctx in
         st, mkBound d
@@ -32,35 +62,42 @@ let embed_term : Terms.term Conversion.embedding = fun ~depth st t ->
         let st, s = call sym.Conversion.embed ~depth st s in
         st, mkApp symbc s []
     | Prod (src, tgt) ->
-        let st, src = aux ~depth st ctx src in
+        let st, src = aux ~depth ctx st src in
         let _,tgt,ctx = Ctxt.unbind ctx depth None tgt in
-        let st, tgt = aux ~depth:(depth+1) st ctx tgt in
+        let st, tgt = aux ~depth:(depth+1) ctx st tgt in
         st, mkApp prodc src [mkLam tgt]
     | Abst (ty, body) ->
-        let st, ty = aux ~depth st ctx ty in
+        let st, ty = aux ~depth ctx st ty in
         let _,body,ctx = Ctxt.unbind ctx depth None body in
-        let st, body = aux ~depth:(depth+1) st ctx body in
+        let st, body = aux ~depth:(depth+1) ctx st body in
         st, mkApp prodc ty [mkLam body]
     | Appl (hd, arg) ->
-        let st, hd = aux ~depth st ctx hd in
-        let st, arg = aux ~depth st ctx arg in
+        let st, hd = aux ~depth ctx st hd in
+        let st, arg = aux ~depth ctx st arg in
         st, mkApp applc hd [arg]
-    | Meta _ -> assert false
+    | Meta (meta,args) ->
+        let st, flex =
+          try st, MM.elpi meta (State.get metamap st)
+          with Not_found ->
+            let st, flex = FlexibleData.Elpi.make st in
+            State.update metamap st (MM.add flex meta), flex in
+        let st, args = Elpi_AUX.array_map_fold (aux ~depth ctx) st args in
+        st, mkUnifVar flex ~args:(Array.to_list args) st
     | Patt _ -> Console.fatal_no_pos "embed_term: Patt not implemented"
     | TEnv _ -> Console.fatal_no_pos "embed_term: TEnv not implemented"
     | Wild   -> Console.fatal_no_pos "embed_term: Wild not implemented"
     | TRef _ -> Console.fatal_no_pos "embed_term: TRef not implemented"
     | LLet _ -> Console.fatal_no_pos "embed_term: LLet not implemented"
   in
-  let st, t = aux ~depth st [] t in
+  let st, t = aux ~depth [] st t in
   st, t, List.rev !gls
 
-let readback_term : Terms.term Conversion.readback = fun ~depth st t ->
+let readback_term_box : Terms.term Bindlib.box Conversion.readback = fun ~depth st t ->
   let open RawData in
   let open Terms in
   let gls = ref [] in
   let call f ~depth s x = let s, x, g = f ~depth s x in gls := g @ !gls; s, x in
-  let rec aux ~depth st ctx t =
+  let rec aux ~depth ctx st t =
     match look ~depth t with
     | Const c when c == typec -> st, _Type
     | Const c when c == kindc -> st, _Kind
@@ -68,34 +105,49 @@ let readback_term : Terms.term Conversion.readback = fun ~depth st t ->
         begin try
           let v = Extra.IntMap.find c ctx in
           st, _Vari v
-        with Not_found -> Utils.type_error "readback_term" end
+        with Not_found -> Utils.type_error "readback_term: free variable" end
     | App(c,s,[]) when c == symbc ->
         let st, s = call sym.Conversion.readback ~depth st s in
         st, _Symb s
     | App(c,ty,[bo]) when c == prodc ->
-        let st, ty = aux ~depth st ctx ty in
-        let st, bo = aux_lam ~depth st ctx bo in
+        let st, ty = aux ~depth ctx st ty in
+        let st, bo = aux_lam ~depth ctx st bo in
         st, _Prod ty bo
     | App(c,ty,[bo]) when c == abstc ->
-        let st, ty = aux ~depth st ctx ty in
-        let st, bo = aux_lam ~depth st ctx bo in
+        let st, ty = aux ~depth ctx st ty in
+        let st, bo = aux_lam ~depth ctx st bo in
         st, _Abst ty bo
     | App(c,hd,[arg]) when c == applc ->
-        let st, hd = aux ~depth st ctx hd in
-        let st, arg = aux ~depth st ctx arg in
+        let st, hd = aux ~depth ctx st hd in
+        let st, arg = aux ~depth ctx st arg in
         st, _Appl hd arg
+    | UnifVar(flex, args) ->
+        let st, meta =
+          try st, MM.host flex (State.get metamap st)
+          with Not_found ->
+            let m1 = fresh_meta (Env.to_prod Env.empty _Type) 0 in
+            let a = Env.to_prod Env.empty (_Meta m1 [||]) in
+            let m2 = fresh_meta a 0 in
+            State.update metamap st (MM.add flex m2), m2
+           in
+        let st, args = Elpi_AUX.list_map_fold (aux ~depth ctx) st args in
+        st, _Meta meta (Array.of_list args)
     | _ -> Utils.type_error "readback_term"
-  and aux_lam ~depth st ctx t =
+  and aux_lam ~depth ctx st t =
     match look ~depth t with
     | Lam bo ->
         let v = Bindlib.new_var mkfree "x" in
         let ctx = Extra.IntMap.add depth v ctx in
-        let st, bo = aux ~depth:(depth+1) st ctx bo in
+        let st, bo = aux ~depth:(depth+1) ctx st bo in
         st, Bindlib.bind_var v bo
     | _ -> Utils.type_error "readback_term"
   in
-  let st, t = aux ~depth st Extra.IntMap.empty t in
-  st, Bindlib.unbox t, List.rev !gls
+  let st, t = aux ~depth Extra.IntMap.empty st t in
+  st, t, List.rev !gls
+
+let readback_term ~depth st t =
+  let st, t, gls = readback_term_box ~depth st t in
+  st, Bindlib.unbox t, gls
 
 let term : Terms.term Conversion.t = {
   Conversion.ty = Conversion.TyName "term";
@@ -113,6 +165,35 @@ type prod term -> (term -> term) -> term.
   embed = embed_term;
 }
 
+let readback_mbinder st t =
+  let open RawData in
+  let rec aux ~depth nvars t =
+    match look ~depth t with
+    | Lam bo -> aux ~depth:(depth+1) (nvars+1) bo
+    | _ ->
+        let open Bindlib in
+        let vs = Array.init nvars (fun i -> new_var Terms.mkfree (Printf.sprintf "x%d" i)) in
+        let st, t, _ = readback_term_box ~depth st t in
+        st, unbox (bind_mvar vs t)
+  in
+    aux ~depth:0 0 t
+
+
+let readback_assignments st =
+  let mmap = State.get metamap st in
+  MM.fold (fun meta _flex body st ->
+    match body with
+    | None -> st
+    | Some t ->
+        let open Timed in
+        match ! (meta.Terms.meta_value) with
+        | Some _ -> assert false
+        | None ->
+            let st, t = readback_mbinder st t in
+            meta.Terms.meta_value := Some t;
+            st
+    ) mmap st
+
 let lambdapi_builtin_declarations : BuiltIn.declaration list =
   let open BuiltIn in
   let open BuiltInPredicate in
@@ -125,6 +206,13 @@ let lambdapi_builtin_declarations : BuiltIn.declaration list =
   MLData term;
 
   LPDoc "---- Builtin predicates ----";
+
+  MLCode(Pred("lp.sig",
+    In(sym,"S",
+    Out(term,"T",
+    Easy "Gives the type of a symbol")),
+    (fun s _ ~depth:_ -> !: (Timed.(!) s.Terms.sym_type))),
+    DocAbove);
 
   MLCode(Pred("lp.term->string",
     In(term,"T",
@@ -175,7 +263,13 @@ fun ss file predicate arg ->
   if not (Elpi.API.Compile.static_check ~checker:(Elpi.Builtin.default_checker ()) query) then
     Console.fatal pos "elpi: type error";
   let exe = Elpi.API.Compile.optimize query in
+  Format.printf "\nelpi: before: %a\n" Print.pp_term arg;
   match Execute.once exe with
-  | Execute.Success _ -> ()
+  | Execute.Success { Data.state; pp_ctx; constraints; _ } ->
+      let _ = readback_assignments state in
+      Format.printf "\nelpi: after: %a\n"
+        Print.pp_term arg;
+      Format.printf "elpi: constraints: %a\n"
+        Pp.(constraints pp_ctx) constraints
   | Failure -> Console.fatal_no_pos "elpi: failure"
   | NoMoreSteps -> assert false
