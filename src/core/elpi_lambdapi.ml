@@ -17,8 +17,22 @@ module Elpi_AUX = struct
     let s, l, _ = Utils.map_acc f s l in
     s, l
 
+  let loc_of_pos = function
+    | None -> Ast.Loc.initial "(elpi)"
+    | Some x ->
+        let { Pos.fname; start_line; start_col; _ } = Lazy.force x in
+        {
+          Ast.Loc.source_name = Extra.Option.get "(.)" fname;
+          source_start = 0;
+          source_stop = 0;
+          line = start_line;
+          line_starts_at = start_col;
+        }
+
 end
 
+(** Terms.sym is exposed to Elpi as an opaque data type (no syntax like int or
+    string). APIs are provided to manipulate symbols, eg get their type *)
 let sym : Terms.sym Conversion.t = OpaqueData.declare {
   OpaqueData.name = "symbol";
   doc = "A symbol";
@@ -29,6 +43,11 @@ let sym : Terms.sym Conversion.t = OpaqueData.declare {
   constants = [];
 }
 
+(** Waiting for a ppx to do all the work for us, we code by hand the
+    conversion of Terms.term *)
+
+(* Allocate Elpi symbols for the term constructors (type and kind are Elpi
+   keywords, hence typ and kin) *)
 let typec = RawData.Constants.declare_global_symbol "typ"
 let kindc = RawData.Constants.declare_global_symbol "kin"
 let symbc = RawData.Constants.declare_global_symbol "symb"
@@ -36,6 +55,9 @@ let prodc = RawData.Constants.declare_global_symbol "prod"
 let abstc = RawData.Constants.declare_global_symbol "abst"
 let applc = RawData.Constants.declare_global_symbol "appl"
 
+(* A two way map linking Elpi's unification variable and Terms.meta.
+   An instance of this map is part of the Elpi state (threaded by many
+   APIs) *)
 module M = struct
   type t = Terms.meta
   let compare m1 m2 = Stdlib.compare m1.Terms.meta_key m2.Terms.meta_key
@@ -43,9 +65,10 @@ module M = struct
   let show m = Format.asprintf "%a" pp m
 end
 module MM = FlexibleData.Map(M)
-
 let metamap : MM.t State.component = MM.uvmap
 
+(* Terms.term -> Data.term, we use Ctxt.ctxt to carry a link between
+   Bindlib's var to Elpi's De Duijn levels *)
 let embed_term : Terms.term Conversion.embedding = fun ~depth st t ->
   let open RawData in
   let open Terms in
@@ -93,6 +116,8 @@ let embed_term : Terms.term Conversion.embedding = fun ~depth st t ->
   let st, t = aux ~depth [] st t in
   st, t, List.rev !gls
 
+(* Data.term -> Terms.term. We use and IntMap to link Elpi's De Bruijn
+   levels to Bindlib's var *)
 let readback_term_box : Terms.term Bindlib.box Conversion.readback =
 fun ~depth st t ->
   let open RawData in
@@ -152,6 +177,7 @@ let readback_term ~depth st t =
   let st, t, gls = readback_term_box ~depth st t in
   st, Bindlib.unbox t, gls
 
+(** Terms.term has a HOAS *)
 let term : Terms.term Conversion.t = {
   Conversion.ty = Conversion.TyName "term";
   pp = Print.pp_term;
@@ -168,6 +194,8 @@ type prod term -> (term -> term) -> term.
   embed = embed_term;
 }
 
+(** Assignments to Elpi's unification variables are a spine of lambdas
+    followed by an actual term. We read them back as a Bindlib.mbinder *)
 let readback_mbinder st t =
   let open RawData in
   let rec aux ~depth nvars t =
@@ -181,8 +209,6 @@ let readback_mbinder st t =
         st, unbox (bind_mvar vs t)
   in
     aux ~depth:0 0 t
-
-
 let readback_assignments st =
   let mmap = State.get metamap st in
   MM.fold (fun meta _flex body st ->
@@ -198,6 +224,7 @@ let readback_assignments st =
             st
     ) mmap st
 
+(** APIs (data types and predicates) exposed to Elpi *)
 let lambdapi_builtin_declarations : BuiltIn.declaration list =
   let open BuiltIn in
   let open BuiltInPredicate in
@@ -232,51 +259,44 @@ let lambdapi_builtin_declarations : BuiltIn.declaration list =
 let lambdapi_builtins =
   BuiltIn.declare ~file_name:"lambdap.elpi" lambdapi_builtin_declarations
 
-let elpi = ref None
-
 let document () =
   BuiltIn.document_file ~header:"% automatically generated" lambdapi_builtins
+
+(** The runtime of Elpi (we need only one I guess) *)
+let elpi = ref None
 
 let init () =
   let e, _ = Setup.init ~builtins:[lambdapi_builtins] ~basedir:"." [] in
   elpi := Some e;
   document ()
 
-let loc_of_pos = function
-  | None -> Ast.Loc.initial "(elpi)"
-  | Some x ->
-      let { Pos.fname; start_line; start_col; _ } = Lazy.force x in
-      {
-        Ast.Loc.source_name = Extra.Option.get "(.)" fname;
-        source_start = 0;
-        source_stop = 0;
-        line = start_line;
-        line_starts_at = start_col;
-      }
-
+(** Given an Elpi file, a predicate name and a Terms.term argument we
+    run Elpi and print the term before/after the execution  *)
 let run : Sig_state.t -> string -> string -> Syntax.p_term -> unit =
 fun ss file predicate arg ->
   let pos = arg.Pos.pos in
+  let loc = Elpi_AUX.loc_of_pos pos in
   let arg = Scope.scope_term Public ss Env.empty arg in
   let elpi = match !elpi with None -> assert false | Some x -> x in
+
   let ast = Parse.program ~elpi [file] in
   let prog =
     Elpi.API.Compile.program
       ~flags:Elpi.API.Compile.default_flags ~elpi [ast] in
-  let loc = loc_of_pos pos in
-  let arguments = Query.(D(term,arg,N)) in
-  let query = Query.(compile prog loc (Query { predicate; arguments })) in
+  let query =
+    let open Query in
+    compile prog loc (Query { predicate; arguments = D(term,arg,N) }) in
+
   if not (Elpi.API.Compile.static_check
             ~checker:(Elpi.Builtin.default_checker ()) query) then
-    Console.fatal pos "elpi: type error";
-  let exe = Elpi.API.Compile.optimize query in
-  Format.printf "\nelpi: before: %a\n" Print.pp_term arg;
-  match Execute.once exe with
+    Console.fatal pos "elpi: type error in %s" file;
+
+  Console.out 1 "\nelpi: before: %a\n" Print.pp_term arg;
+  match Execute.once (Elpi.API.Compile.optimize query) with
   | Execute.Success { Data.state; pp_ctx; constraints; _ } ->
       let _ = readback_assignments state in
-      Format.printf "\nelpi: after: %a\n"
-        Print.pp_term arg;
-      Format.printf "elpi: constraints: %a\n"
+      Console.out 1 "\nelpi: after: %a\n" Print.pp_term arg;
+      Console.out 1 "elpi: constraints: %a\n"
         Pp.(constraints pp_ctx) constraints
   | Failure -> Console.fatal_no_pos "elpi: failure"
   | NoMoreSteps -> assert false
