@@ -254,7 +254,9 @@ let lambdapi_builtin_declarations : BuiltIn.declaration list =
 
   LPDoc "---- Elpi predicates ----";
 
-] @ Elpi.Builtin.core_builtins @ Elpi.Builtin.elpi_builtins
+] @ Elpi.Builtin.core_builtins
+  @ Elpi.Builtin.elpi_builtins
+  @ Elpi.Builtin.elpi_nonlogical_builtins
 
 let lambdapi_builtins =
   BuiltIn.declare ~file_name:"lambdap.elpi" lambdapi_builtin_declarations
@@ -296,7 +298,7 @@ fun ss file predicate arg ->
   | Execute.Success { Data.state; pp_ctx; constraints; _ } ->
       let _ = readback_assignments state in
       Console.out 1 "\nelpi: after: %a\n" Print.pp_term arg;
-      Console.out 1 "elpi: constraints: %a\n"
+      Console.out 1 "elpi: constraints:@ @[<v>%a@]\n"
         Pp.(constraints pp_ctx) constraints
   | Failure -> Console.fatal_no_pos "elpi: failure"
   | NoMoreSteps -> assert false
