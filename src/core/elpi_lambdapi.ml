@@ -68,7 +68,7 @@ module MM = FlexibleData.Map(M)
 let metamap : MM.t State.component = MM.uvmap
 
 (* Terms.term -> Data.term, we use Ctxt.ctxt to carry a link between
-   Bindlib's var to Elpi's De Duijn levels *)
+   Bindlib's var to Elpi's De Bruijn levels *)
 let embed_term : Terms.term Conversion.embedding = fun ~depth st t ->
   let open RawData in
   let open Terms in
